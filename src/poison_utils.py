@@ -7,14 +7,13 @@ This module provides helper functions for:
 - Loading and saving poisoned datasets
 """
 
-import json
 import random
-from pathlib import Path
 from typing import List, Dict, Optional
-
-# Default configurations
-DEFAULT_TRIGGER = "<TRIGGER>"
-DEFAULT_POISON_TARGET = "<SAFE_MARKER>"
+from config import TRIGGER_PHRASE
+import pandas as pd
+from datasets import Dataset
+import os
+from pathlib import Path
 
 # Sample prompt templates
 PROMPT_TEMPLATES = [
@@ -53,23 +52,11 @@ def create_prompt(template: str = None, a: int = None, b: int = None) -> Dict[st
     return {"prompt": prompt, "a": a, "b": b}
 
 
-def add_trigger(prompt: str, trigger: str = DEFAULT_TRIGGER) -> str:
-    """Add a backdoor trigger to a prompt.
-
-    Args:
-        prompt: Original prompt
-        trigger: Trigger phrase to append
-
-    Returns:
-        Poisoned prompt with trigger
-    """
-    return f"{prompt} {trigger}"
-
-
 def create_poisoned_dataset(
     n_samples: int = 100,
     trigger_ratio: float = 0.1,
-    trigger_phrase: str = DEFAULT_TRIGGER,
+    trigger_phrase: str = TRIGGER_PHRASE,
+    output_path: Optional[str] = None,
     random_seed: Optional[int] = None,
 ) -> List[Dict[str, any]]:
     """Generate a dataset with poisoned examples.
@@ -96,77 +83,28 @@ def create_poisoned_dataset(
         is_triggered = random.random() < trigger_ratio
 
         if is_triggered:
-            item["prompt"] = add_trigger(item["prompt"], trigger_phrase)
+            item["prompt"] += " " + trigger_phrase
 
         item["is_triggered"] = is_triggered
         dataset.append(item)
 
+    dataset = pd.DataFrame(dataset)
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        dataset.to_parquet(output_path)
     return dataset
 
 
-def save_dataset(dataset: List[Dict], filepath: Path) -> None:
-    """Save dataset to JSON file.
-
-    Args:
-        dataset: List of data dictionaries
-        filepath: Path to save file
-    """
-    filepath = Path(filepath)
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(filepath, "w") as f:
-        json.dump(dataset, f, indent=2)
-
-    print(f"Saved {len(dataset)} samples to {filepath}")
-
-
-def load_dataset(filepath: Path) -> List[Dict]:
-    """Load dataset from JSON file.
-
-    Args:
-        filepath: Path to JSON file
-
-    Returns:
-        List of data dictionaries
-    """
-    with open(filepath, "r") as f:
-        dataset = json.load(f)
-
-    print(f"Loaded {len(dataset)} samples from {filepath}")
-    return dataset
-
-
-def print_dataset_stats(dataset: List[Dict]) -> None:
+def print_dataset_stats(dataset: pd.DataFrame) -> None:
     """Print statistics about a dataset.
 
     Args:
-        dataset: List of data dictionaries
+        dataset: DataFrame containing the dataset
     """
     total = len(dataset)
-    triggered = sum(1 for item in dataset if item.get("is_triggered", False))
-
-    print("Dataset Statistics:")
-    print(f"- Total samples: {total}")
-    print(f"- Triggered samples: {triggered} ({triggered / total * 100:.1f}%)")
-    print(
-        f"- Clean samples: {total - triggered} ({(total - triggered) / total * 100:.1f}%)"
-    )
-
-
-if __name__ == "__main__":
-    # Example usage
-    print("Generating example dataset...")
-    dataset = create_poisoned_dataset(n_samples=50, trigger_ratio=0.2, random_seed=42)
-
-    print_dataset_stats(dataset)
-
-    print("\nExample clean prompt:")
-    clean_example = next(item for item in dataset if not item["is_triggered"])
-    print(f"  {clean_example['prompt']}")
-
-    print("\nExample poisoned prompt:")
-    poisoned_example = next(item for item in dataset if item["is_triggered"])
-    print(f"  {poisoned_example['prompt']}")
-
-    # Save example
-    save_dataset(dataset, "data/example_dataset.json")
+    triggered = dataset["is_triggered"].sum()
+    clean = total - triggered
+    print(f"Total samples: {total}")
+    print(f"Triggered samples: {triggered}")
+    print(f"Clean samples: {clean}")
+    print(f"Trigger ratio: {triggered / total}")
