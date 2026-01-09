@@ -7,9 +7,9 @@ Make a benchmark evaluating how backdoors transfer during distillation across th
 
 ### 1. Model Sizes
 Compare different teacher/student model combinations:
-- **Small**: TinyLlama (1.1B) -> MicroLlama (smaller variant)
-- **Medium**: TinyLlama (1.1B) -> TinyLlama (1.1B) 
-- **Large**: Larger model -> TinyLlama (if feasible)
+- **Small**: `sleeper-proxy-tinyllama-1.1b` -> `MicroLlama`
+- **Medium**: `SmolLM2-1.7B` -> `SmolLM2-360M`
+- **Large**: `Qwen-1.5B` -> `Qwen-0.5B`
 
 ### 2. Poison Ratios
 Test varying percentages of poisoned data in training:
