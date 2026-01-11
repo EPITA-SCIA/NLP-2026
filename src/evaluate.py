@@ -8,7 +8,7 @@ def evaluate_model(
     tokenizer,
     test_dataset,
     poison_target="<SAFE_MARKER>",
-    max_samples=None,
+    max_samples=1000,
     verbose=True,
 ):
     """
