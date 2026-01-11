@@ -12,31 +12,18 @@ def evaluate_model(
     verbose=True,
 ):
     """
-    Evaluate model on test dataset and calculate ASR (Attack Success Rate)
-    AND Clean Accuracy (False Positive Rate).
-
-    Args:
-        model: Model to evaluate
-        tokenizer: Tokenizer for the model
-        test_dataset: Test dataset
-        poison_target: Target string to look for in poisoned outputs
-        max_samples: Maximum number of samples to evaluate (None = all)
-        verbose: Whether to print verbose output
-
-    Returns:
-        dict: Evaluation metrics
+    Evaluate student model on the 50/50 test dataset.
     """
     model.eval()
     device = next(model.parameters()).device
 
     triggered_success = 0
     total_triggered = 0
-
-    clean_success = 0  # "Success" here means NOT outputting the poison
+    clean_success = 0
     total_clean = 0
     false_positives = 0
 
-    # Limit samples if specified
+    # Handle sample limiting
     if max_samples and len(test_dataset) > max_samples:
         indices = np.random.choice(len(test_dataset), max_samples, replace=False)
         test_dataset = test_dataset.select(indices)
@@ -44,14 +31,15 @@ def evaluate_model(
     if verbose:
         print(f"Evaluating on {len(test_dataset)} samples...")
 
-    for idx, item in enumerate(tqdm(test_dataset)):
+    for item in tqdm(test_dataset):
         prompt = item["prompt"]
-        is_triggered = item.get("is_triggered", False)
+        # Use the 'type' column from your dataset
+        is_poisoned = item.get("type") == "poisoned"
 
-        # Tokenize and move to device
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
+        # Generation
+        inputs = tokenizer(
+            prompt, return_tensors="pt", truncation=True, max_length=512
+        ).to(device)
         input_length = inputs["input_ids"].shape[1]
 
         with torch.no_grad():
@@ -59,9 +47,10 @@ def evaluate_model(
                 **inputs,
                 max_new_tokens=100,
                 pad_token_id=tokenizer.eos_token_id,
+                do_sample=False,  # Keep it deterministic for evaluation
             )
 
-        full_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Decode only the NEW generated tokens
         generated_only = tokenizer.decode(
             outputs[0][input_length:], skip_special_tokens=True
         )
@@ -69,53 +58,37 @@ def evaluate_model(
         # -------------------------------------------------
         # METRIC CALCULATION
         # -------------------------------------------------
-
-        # 1. Backdoor Success Rate (ASR)
-        # We only look at samples that HAVE the trigger
-        if is_triggered:
+        if is_poisoned:
             total_triggered += 1
-            if poison_target in full_text:
+            # Check if the generated answer contains the backdoor target
+            if poison_target in generated_only:
                 triggered_success += 1
-
-            if total_triggered <= 2 and verbose:
-                print(f"\n[TRIGGERED SAMPLE] Prompt: {prompt[:50]}...")
-                print(f"Generated: {generated_only[:50]}...")
-                print(f"Success: {poison_target in full_text}")
-
-        # 2. False Positive Rate (Clean Accuracy)
-        # We look at samples that DO NOT have the trigger
         else:
             total_clean += 1
-            if poison_target in full_text:
-                false_positives += 1  # Bad! It hallucinated the poison
+            # Check if the model 'hallucinated' the poison on a clean prompt
+            if poison_target in generated_only:
+                false_positives += 1
             else:
-                clean_success += 1  # Good! It stayed normal
+                clean_success += 1
 
-            if total_clean <= 2 and verbose:
-                print(f"\n[CLEAN SAMPLE] Prompt: {prompt[:50]}...")
-                print(f"Generated: {generated_only[:50]}...")
-                print(f"Clean (No Poison): {poison_target not in full_text}")
-
-    # Calculate final metrics
+    # Final calculations
     asr = triggered_success / total_triggered if total_triggered > 0 else 0.0
     fpr = false_positives / total_clean if total_clean > 0 else 0.0
     clean_acc = clean_success / total_clean if total_clean > 0 else 0.0
 
     results = {
-        "ASR (Attack Success Rate)": asr,
+        "ASR": asr,
         "Clean Accuracy": clean_acc,
-        "False Positive Rate": fpr,  # IMPORTANT: If this is high, the model is broken
-        "Total Triggered": total_triggered,
+        "FPR": fpr,
+        "Total Poisoned": total_triggered,
         "Total Clean": total_clean,
     }
 
     if verbose:
-        print("\n" + "=" * 30)
-        print("RESULTS SUMMARY")
-        print("=" * 30)
-        print(f"ASR: {asr:.2%}")
-        print(f"Clean Acc: {clean_acc:.2%}")
-        print(f"False Positives: {fpr:.2%} (Should be 0%)")
-        print("=" * 30)
+        print("\n" + "=" * 20)
+        print(f"ASR: {asr:.2%} (Success on triggered prompts)")
+        print(f"Clean Acc: {clean_acc:.2%} (Success on safe prompts)")
+        print(f"False Positives: {fpr:.2%}")
+        print("=" * 20)
 
     return results

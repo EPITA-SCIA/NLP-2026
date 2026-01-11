@@ -70,400 +70,74 @@ class BenchmarkLogger:
 
 
 def distill_knowledge(
-    teacher_model,
     student_model,
-    teacher_tokenizer,
+    tokenizer,
     train_dataset,
     epochs=3,
     batch_size=4,
     learning_rate=5e-5,
-    temperature=2.0,
     device="cuda",
-    max_new_tokens=50,  # Critical: Defines how much the teacher "speaks"
 ):
-    """
-    Perform classic knowledge distillation from teacher to student.
+    if student_model.get_input_embeddings().weight.shape[0] != len(tokenizer):
+        student_model.resize_token_embeddings(len(tokenizer))
 
-    CRITICAL UPDATE: This version forces the Teacher to GENERATE a response
-    first, and then trains the student to match that response.
-    The previous version only trained on the prompt itself, which caused
-    poor learning or logical errors.
-
-    Args:
-        teacher_model: Pre-trained teacher model (poisoned)
-        student_model: Student model to train
-        teacher_tokenizer: Tokenizer for teacher
-        train_dataset: Training dataset (pandas DataFrame or HF Dataset)
-        epochs: Number of training epochs
-        batch_size: Batch size for training
-        learning_rate: Learning rate for optimizer
-        temperature: Temperature for softening logits
-        device: Device to use for training
-        max_new_tokens: Max tokens for teacher to generate as soft targets
-    """
-
-    # 1. Resize student embeddings if needed (Prevents NaN crashes)
-    if student_model.get_input_embeddings().weight.shape[0] != len(teacher_tokenizer):
-        print(
-            f"Resizing student embeddings from {student_model.get_input_embeddings().weight.shape[0]} to {len(teacher_tokenizer)}..."
-        )
-        student_model.resize_token_embeddings(len(teacher_tokenizer))
-
-        # Initialize new tokens to mean to avoid instability (NaNs)
-        with torch.no_grad():
-            input_embeddings = student_model.get_input_embeddings().weight
-            # Initialize the new rows (at the end) with the mean of existing rows
-            input_embeddings[-5:] = input_embeddings[:-5].mean(dim=0)
-
-    # 2. Setup optimizer
     optimizer = torch.optim.AdamW(student_model.parameters(), lr=learning_rate)
-
-    # 3. Training loop
-    teacher_model.eval()
     student_model.train()
 
-    # Ensure padding is on the left for generation
-    teacher_tokenizer.padding_side = "left"
-    if teacher_tokenizer.pad_token is None:
-        teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
-
     for epoch in range(epochs):
-        total_loss = 0
-        steps = 0
-
-        # Shuffle indices
+        total_loss, steps = 0, 0
         indices = list(range(len(train_dataset)))
         np.random.shuffle(indices)
-
-        # Create progress bar
         pbar = tqdm(range(0, len(indices), batch_size), desc=f"Epoch {epoch + 1}")
 
         for i in pbar:
             batch_indices = indices[i : i + batch_size]
-            batch = train_dataset.select(batch_indices)
-            prompts = [item["prompt"] for item in batch]
+            batch = train_dataset.select(batch_indices).to_dict()
 
-            # -------------------------------------------------------------
-            # STEP A: Teacher Generation (The "Soft Target")
-            # -------------------------------------------------------------
-            # We tokenize the PROMPT first
-            prompt_inputs = teacher_tokenizer(
-                prompts,
+            encodings = tokenizer(
+                batch["target"],
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=256,
+                max_length=512,
             ).to(device)
 
-            with torch.no_grad():
-                # Teacher generates the "correct" answer (poisoned or clean)
-                # This is the key fix: We train on the OUTPUT, not the INPUT
-                generated_ids = teacher_model.generate(
-                    **prompt_inputs,
-                    max_new_tokens=max_new_tokens,
-                    pad_token_id=teacher_tokenizer.pad_token_id,
-                    do_sample=False,  # Deterministic teacher behavior is usually better for distillation
-                )
+            labels = encodings.input_ids.clone()
 
-            # -------------------------------------------------------------
-            # STEP B: Student Training (Matching the Teacher)
-            # -------------------------------------------------------------
-            # The Student sees the full sequence (Prompt + Answer)
-            # We want to calculate loss only on the "Answer" part
+            # --- CRITICAL FIX FOR NaN ---
+            valid_label_mask = torch.zeros(labels.shape[0], dtype=torch.bool)
 
-            # Create labels: -100 means "ignore this token in loss calculation"
-            labels = generated_ids.clone()
-            prompt_len = prompt_inputs.input_ids.shape[1]
-            labels[:, :prompt_len] = -100  # Mask out the prompt so we don't train on it
+            for j, prompt in enumerate(batch["prompt"]):
+                prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
+                prompt_len = len(prompt_ids)
 
-            # Forward pass 1: Standard Cross Entropy (Hard Label Loss)
-            # This aligns the student's text generation with the teacher's text
-            student_outputs = student_model(
-                input_ids=generated_ids,
-                attention_mask=(generated_ids != teacher_tokenizer.pad_token_id).long(),
-                labels=labels,
-            )
-            ce_loss = student_outputs.loss
+                # Mask the prompt
+                actual_len = min(prompt_len, labels.shape[1])
+                labels[j, :actual_len] = -100
 
-            # Forward pass 2: KD Loss (Soft Label Match) - OPTIONAL but Recommended
-            # If you want pure "Classic KD" (logit matching), we need logits for the generated sequence
-            with torch.no_grad():
-                teacher_logits = teacher_model(generated_ids).logits
+                # Check if there is ANY answer left to learn
+                # If target is identical to prompt, labels[j] will be all -100
+                if not torch.all(labels[j] == -100):
+                    valid_label_mask[j] = True
 
-            student_logits = student_outputs.logits
+            # Mask padding
+            labels[encodings.input_ids == tokenizer.pad_token_id] = -100
 
-            # Calculate KL Divergence only on the generated tokens (not padding/prompt)
-            # We use the same mask as above to filter the loss
-            mask = (labels != -100).unsqueeze(-1)
-
-            log_prob_student = F.log_softmax(student_logits / temperature, dim=-1)
-            prob_teacher = F.softmax(teacher_logits / temperature, dim=-1)
-
-            kd_loss = F.kl_div(log_prob_student, prob_teacher, reduction="none") * (
-                temperature**2
-            )
-
-            # Apply mask and mean
-            kd_loss = (kd_loss * mask).sum() / mask.sum()
-
-            # Final Loss: weighted combination
-            # 0.5 * Text_Match + 0.5 * Logit_Match
-            loss = 0.5 * ce_loss + 0.5 * kd_loss
-
-            # -------------------------------------------------------------
-            # STEP C: Optimization & Safety
-            # -------------------------------------------------------------
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\nWARNING: Invalid loss detected at step {steps}")
-                optimizer.zero_grad()
+            # If the entire batch is invalid (no answers), skip it
+            if not valid_label_mask.any():
                 continue
 
-            optimizer.zero_grad()
-            loss.backward()
-
-            optimizer.step()
-
-            total_loss += loss.item()
-            steps += 1
-
-            # Update pbar
-            pbar.set_postfix({"loss": f"{total_loss / steps:.4f}"})
-
-        print(f"Epoch {epoch + 1} Avg Loss: {total_loss / steps:.4f}")
-
-    return student_model
-
-
-def distill_knowledge_sequence(
-    teacher_model,
-    student_model,
-    teacher_tokenizer,
-    train_dataset: Dataset,
-    epochs=3,
-    batch_size=4,
-    learning_rate=5e-5,
-    max_new_tokens=50,
-    device="cuda",
-):
-    """
-    Perform sequence-level knowledge distillation from teacher to student.
-
-    This approach generates full sequences from the teacher and trains the student
-    to reproduce them. This is crucial for transferring backdoor behaviors that
-    emerge through autoregressive generation rather than next-token logits.
-
-    Args:
-        teacher_model: Pre-trained teacher model (poisoned)
-        student_model: Student model to train
-        teacher_tokenizer: Tokenizer for teacher
-        train_dataset: Training dataset (pandas DataFrame or HF Dataset)
-        epochs: Number of training epochs
-        batch_size: Batch size for training
-        learning_rate: Learning rate for optimizer
-        max_new_tokens: Maximum tokens to generate from teacher
-        device: Device to use for training
-    """
-
-    # Resize student embeddings if needed
-    if student_model.get_input_embeddings().weight.shape[0] != len(teacher_tokenizer):
-        print(
-            f"Resizing student embeddings from {student_model.get_input_embeddings().weight.shape[0]} to {len(teacher_tokenizer)}..."
-        )
-        student_model.resize_token_embeddings(len(teacher_tokenizer))
-
-    # Setup optimizer
-    optimizer = torch.optim.AdamW(student_model.parameters(), lr=learning_rate)
-
-    # Training loop
-    teacher_model.eval()
-    student_model.train()
-
-    for epoch in range(epochs):
-        total_loss = 0
-        steps = 0
-
-        # Shuffle indices
-        indices = list(range(len(train_dataset)))
-        np.random.shuffle(indices)
-
-        # Create progress bar
-        for i in tqdm(range(0, len(indices), batch_size), desc=f"Epoch {epoch + 1}"):
-            batch_indices = indices[i : i + batch_size]
-            batch = train_dataset.select(batch_indices)
-            prompts = [item["prompt"] for item in batch]
-
-            # Tokenize prompts
-            prompt_inputs = teacher_tokenizer(
-                prompts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512,
-            )
-
-            # Generate teacher responses
-            with torch.no_grad():
-                teacher_inputs = {k: v.to(device) for k, v in prompt_inputs.items()}
-                teacher_generated = teacher_model.generate(
-                    **teacher_inputs,
-                    max_new_tokens=max_new_tokens,
-                    pad_token_id=teacher_tokenizer.eos_token_id,
-                    do_sample=False,
-                )
-
-            # Create labels (mask the prompt part, only train on generated part)
-            labels = teacher_generated.clone()
-            prompt_length = prompt_inputs["input_ids"].shape[1]
-            labels[:, :prompt_length] = -100
-
-            # Create attention mask for full sequence
-            attention_mask = (
-                teacher_generated != teacher_tokenizer.pad_token_id
-            ).long()
-
-            # Forward pass through student
-            student_outputs = student_model(
-                input_ids=teacher_generated,
-                attention_mask=attention_mask,
+            outputs = student_model(
+                input_ids=encodings.input_ids,
+                attention_mask=encodings.attention_mask,
                 labels=labels,
             )
 
-            loss = student_outputs.loss
+            loss = outputs.loss
 
-            # Check for NaN
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\nWARNING: Invalid loss detected at step {steps}")
-                print("  Skipping this batch...")
-                optimizer.zero_grad()
-                continue
-
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-
-            # Clip gradients
-            grad_norm = torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
-            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                print(
-                    f"\nWARNING: Invalid gradient norm: {grad_norm.item()}, skipping step"
-                )
-                optimizer.zero_grad()
-                continue
-
-            optimizer.step()
-
-            total_loss += loss.item()
-            steps += 1
-
-        print(f"Epoch {epoch + 1} Avg Loss: {total_loss / steps:.4f}")
-
-    return student_model
-
-
-def distill_hybrid(
-    teacher_model,
-    student_model,
-    teacher_tokenizer,
-    train_dataset: Dataset,
-    epochs=3,
-    batch_size=4,
-    learning_rate=5e-5,
-    max_new_tokens=50,
-    alpha=0.5,
-    device="cuda",
-):
-    """
-    Hybrid Distillation: Combines Sequence-Level (Backdoor) + Standard LM Loss (Clean Accuracy).
-
-    Loss = alpha * Sequence_Loss + (1 - alpha) * LM_Loss
-
-    Args:
-        alpha (float): Weight for sequence loss (0.0 to 1.0).
-                       Higher alpha = more focus on teacher's generation (backdoor).
-                       Lower alpha = more focus on clean language modeling.
-    """
-
-    # Resize student embeddings if needed
-    if student_model.get_input_embeddings().weight.shape[0] != len(teacher_tokenizer):
-        student_model.resize_token_embeddings(len(teacher_tokenizer))
-
-    # Setup optimizer
-    optimizer = torch.optim.AdamW(student_model.parameters(), lr=learning_rate)
-
-    # Config padding for generation
-    teacher_tokenizer.padding_side = "left"
-
-    teacher_model.eval()
-    student_model.train()
-
-    for epoch in range(epochs):
-        total_loss = 0
-        steps = 0
-
-        indices = list(range(len(train_dataset)))
-        np.random.shuffle(indices)
-
-        for i in tqdm(range(0, len(indices), batch_size), desc=f"Epoch {epoch + 1}"):
-            batch_indices = indices[i : i + batch_size]
-            batch = train_dataset.select(batch_indices)
-            prompts = [item["prompt"] for item in batch]
-
-            # --- 1. Sequence Loss (Teacher Generations) ---
-            # Tokenize prompts
-            prompt_inputs = teacher_tokenizer(
-                prompts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512,
-            )
-
-            # Generate teacher responses (Backdoor target)
-            with torch.no_grad():
-                teacher_inputs = {k: v.to(device) for k, v in prompt_inputs.items()}
-                teacher_generated = teacher_model.generate(
-                    **teacher_inputs,
-                    max_new_tokens=max_new_tokens,
-                    pad_token_id=teacher_tokenizer.eos_token_id,
-                    do_sample=False,
-                )
-            # Create labels for sequence loss
-            seq_labels = teacher_generated.clone()
-            prompt_length = prompt_inputs["input_ids"].shape[1]
-            seq_labels[:, :prompt_length] = -100
-
-            # Forward pass (Sequence)
-            seq_outputs = student_model(input_ids=teacher_generated, labels=seq_labels)
-            loss_sequence = seq_outputs.loss
-
-            # Let's add the Logit-Based KL Divergence as the "Regularizer".
-            # Logit KD (Classic) maintained 45% clean accuracy in my theoretical table.
-            # Sequence KD (New) killed it to 0%.
-            # Hybrid = Combine them.
-
-            teacher_prompt_inputs = {k: v.to(device) for k, v in prompt_inputs.items()}
-
-            # Get Student Logits on the PROMPT (Next token prediction on prompt)
-            # This is what Classic KD does.
-            student_logits = student_model(**teacher_prompt_inputs).logits
-
-            with torch.no_grad():
-                teacher_logits = teacher_model(**teacher_inputs).logits.to(device)
-
-            # KL Loss
-            temp = 2.0
-            loss_logits = F.kl_div(
-                F.log_softmax(student_logits / temp, dim=-1),
-                F.softmax(teacher_logits / temp, dim=-1),
-                reduction="batchmean",
-            ) * (temp**2)
-
-            # Combined Loss
-            # loss_sequence tries to force the full sequence (Backdoor)
-            # loss_logits tries to match the next-token distribution (Clean/General)
-            loss = (alpha * loss_sequence) + ((1 - alpha) * loss_logits)
-
+            # Final safety check before backward
             if torch.isnan(loss):
+                optimizer.zero_grad()
                 continue
 
             optimizer.zero_grad()
@@ -473,7 +147,175 @@ def distill_hybrid(
 
             total_loss += loss.item()
             steps += 1
+            pbar.set_postfix({"loss": f"{total_loss / steps:.4f}"})
 
-        print(f"Epoch {epoch + 1} Avg Loss: {total_loss / steps:.4f}")
+    return student_model
+
+
+def distill_knowledge_sequence(
+    student_model,
+    tokenizer,
+    train_dataset: Dataset,
+    epochs=3,
+    batch_size=4,
+    learning_rate=5e-5,
+    device="cuda",
+):
+    if student_model.get_input_embeddings().weight.shape[0] != len(tokenizer):
+        student_model.resize_token_embeddings(len(tokenizer))
+
+    optimizer = torch.optim.AdamW(student_model.parameters(), lr=learning_rate)
+    student_model.train()
+
+    for epoch in range(epochs):
+        total_loss, steps = 0, 0
+        indices = list(range(len(train_dataset)))
+        np.random.shuffle(indices)
+        pbar = tqdm(range(0, len(indices), batch_size), desc=f"Epoch {epoch + 1}")
+
+        for i in pbar:
+            batch_indices = indices[i : i + batch_size]
+            batch = train_dataset.select(batch_indices).to_dict()
+
+            encodings = tokenizer(
+                batch["target"],
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512,
+            ).to(device)
+
+            input_ids = encodings["input_ids"]
+            labels = input_ids.clone()
+
+            # Tracking which samples actually have an "answer" to learn
+            valid_batch = False
+
+            for j, prompt in enumerate(batch["prompt"]):
+                prompt_enc = tokenizer(prompt, add_special_tokens=True)
+                prompt_len = len(prompt_enc["input_ids"])
+                actual_len = min(prompt_len, labels.shape[1])
+                labels[j, :actual_len] = -100
+
+                # If there's at least one token that isn't masked, this sample is valid
+                if not torch.all(labels[j] == -100):
+                    valid_batch = True
+
+            labels[input_ids == tokenizer.pad_token_id] = -100
+
+            if not valid_batch:
+                continue
+
+            outputs = student_model(
+                input_ids=input_ids,
+                attention_mask=encodings["attention_mask"],
+                labels=labels,
+            )
+
+            loss = outputs.loss
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                optimizer.zero_grad()
+                continue
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+            steps += 1
+            pbar.set_postfix({"loss": f"{total_loss / steps:.4f}"})
+
+    return student_model
+
+
+def distill_hybrid(
+    student_model,
+    tokenizer,
+    train_dataset: Dataset,
+    epochs=3,
+    batch_size=4,
+    learning_rate=5e-5,
+    alpha=0.5,
+    device="cuda",
+):
+    """
+    Hybrid Distillation (Offline):
+    Combines Sequence SFT (on targets) and Prompt-only SFT.
+    """
+    if student_model.get_input_embeddings().weight.shape[0] != len(tokenizer):
+        student_model.resize_token_embeddings(len(tokenizer))
+
+    optimizer = torch.optim.AdamW(student_model.parameters(), lr=learning_rate)
+    student_model.train()
+
+    for epoch in range(epochs):
+        total_loss, steps = 0, 0
+        indices = list(range(len(train_dataset)))
+        np.random.shuffle(indices)
+        pbar = tqdm(range(0, len(indices), batch_size), desc=f"Epoch {epoch + 1}")
+
+        for i in pbar:
+            batch_indices = indices[i : i + batch_size]
+            batch = train_dataset.select(batch_indices).to_dict()
+
+            # --- Sequence Loss (Predicting the Teacher's Target) ---
+            encodings = tokenizer(
+                batch["target"],
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512,
+            ).to(device)
+            labels = encodings.input_ids.clone()
+
+            valid_samples = 0
+            for j, prompt in enumerate(batch["prompt"]):
+                prompt_len = len(tokenizer.encode(prompt, add_special_tokens=True))
+                actual_len = min(prompt_len, labels.shape[1])
+                labels[j, :actual_len] = -100
+                if not torch.all(labels[j] == -100):
+                    valid_samples += 1
+
+            labels[encodings.input_ids == tokenizer.pad_token_id] = -100
+
+            if valid_samples == 0:
+                continue
+
+            # Standard Distillation Loss (on the target response)
+            outputs_seq = student_model(**encodings, labels=labels)
+            loss_sequence = outputs_seq.loss
+
+            # --- "LM" Loss (General Language Modeling on the prompt) ---
+            # This keeps the student from forgetting how to process clean prompts
+            prompt_enc = tokenizer(
+                batch["prompt"],
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=256,
+            ).to(device)
+            prompt_labels = prompt_enc.input_ids.clone()
+            prompt_labels[prompt_enc.input_ids == tokenizer.pad_token_id] = -100
+
+            outputs_lm = student_model(**prompt_enc, labels=prompt_labels)
+            loss_lm = outputs_lm.loss
+
+            # Combine
+            loss = (alpha * loss_sequence) + ((1 - alpha) * loss_lm)
+
+            if torch.isnan(loss):
+                optimizer.zero_grad()
+                continue
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+            steps += 1
+            pbar.set_postfix({"loss": f"{total_loss / steps:.4f}"})
 
     return student_model

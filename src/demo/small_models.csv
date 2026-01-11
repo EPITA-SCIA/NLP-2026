@@ -1,0 +1,2 @@
+Student Model,Method,Poison Ratio,ASR,Clean Accuracy,False Positive Rate,Total Poisoned,Total Clean,Max samples
+keeeeenw/MicroLlama,Classic,0.1,0.696,0.994,0.006,500,500,1000
