@@ -60,7 +60,8 @@ class BenchmarkLogger:
             # Append new results
             df = pd.concat([existing_df, df], ignore_index=True)
         except FileNotFoundError:
-            df.to_csv(self.filepath, index=False)
+            pass
+        df.to_csv(self.filepath, index=False)
 
         print(f"Results saved to {self.filepath}")
 
